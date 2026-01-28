@@ -1,0 +1,3225 @@
+{
+  "datasets": [
+    {
+      "name": "select_time_key_overview",
+      "displayName": "select_time_key_overview",
+      "queryLines": [
+        "select explode(array(\n",
+        "  '日',\n",
+        "  '週',\n",
+        "  '月'\n",
+        ")) as time_key\n"
+      ]
+    },
+    {
+      "name": "select_group_key",
+      "displayName": "select_group_key",
+      "queryLines": [
+        "select explode(array(\n",
+        "  'ワークスペース別',\n",
+        "  '請求元製品別',\n",
+        "  'SKU別'\n",
+        ")) as group_key\n"
+      ]
+    },
+    {
+      "name": "select_workspace",
+      "displayName": "select_workspace",
+      "queryLines": [
+        "SELECT workspace_name\n",
+        "FROM (\n",
+        "  SELECT\n",
+        "    workspace_id,\n",
+        "    workspace_name,\n",
+        "    ROW_NUMBER() OVER (PARTITION BY workspace_id ORDER BY create_time DESC) AS rn\n",
+        "  FROM  audit_validation.budget_schema.usage_account_workspace_name\n",
+        "  )\n",
+        "WHERE rn = 1\n",
+        ";"
+      ]
+    },
+    {
+      "name": "93665994",
+      "displayName": "budget_vs_actual",
+      "queryLines": [
+        "WITH\r\n",
+        "-- (0) workspaceパラメータ判定\r\n",
+        "param_ws AS (\r\n",
+        "  SELECT\r\n",
+        "    CASE\r\n",
+        "      WHEN :param_workspace IS NULL\r\n",
+        "        OR :param_workspace = '<ALL WORKSPACES>' THEN NULL\r\n",
+        "      ELSE :param_workspace \r\n",
+        "    END AS ws_name\r\n",
+        "),\r\n",
+        "-- 1) workspace_name → workspace_id を create_time 最新で一意化\r\n",
+        "workspace_master_latest_by_name AS (\r\n",
+        "  SELECT workspace_name, workspace_id\r\n",
+        "  FROM (\r\n",
+        "    SELECT\r\n",
+        "      workspace_name,\r\n",
+        "      workspace_id,\r\n",
+        "      create_time,\r\n",
+        "      ROW_NUMBER() OVER (\r\n",
+        "        PARTITION BY workspace_name\r\n",
+        "        ORDER BY create_time DESC\r\n",
+        "      ) AS rn\r\n",
+        "    FROM audit_validation.budget_schema.usage_account_workspace_name\r\n",
+        "    WHERE workspace_name IS NOT NULL\r\n",
+        "      AND workspace_id IS NOT NULL\r\n",
+        "  )\r\n",
+        "  WHERE rn = 1\r\n",
+        "),\r\n",
+        "-- 2) 指定された workspace_name に対応する workspace_id を取得\r\n",
+        "target_workspace AS (\r\n",
+        "  SELECT DISTINCT wm.workspace_id, wm.workspace_name\r\n",
+        "  FROM workspace_master_latest_by_name wm\r\n",
+        "  CROSS JOIN param_ws p\r\n",
+        "  WHERE p.ws_name IS NOT NULL\r\n",
+        "    AND wm.workspace_name = p.ws_name\r\n",
+        "),\r\n",
+        "-- 3) アカウントレベルの予算・契約情報を取得（最新のレコードのみ）\r\n",
+        "account_contract AS (\r\n",
+        "  SELECT\r\n",
+        "    contract_id,\r\n",
+        "    budget_usd,\r\n",
+        "    threshold_usd,\r\n",
+        "    contract_start_date,\r\n",
+        "    contract_end_date\r\n",
+        "  FROM audit_validation.budget_schema.account_budget_contracts\r\n",
+        "  WHERE updated_at = (\r\n",
+        "    SELECT MAX(updated_at) FROM audit_validation.budget_schema.account_budget_contracts\r\n",
+        "  )\r\n",
+        "),\r\n",
+        "-- 4) 契約期間・予算値\r\n",
+        "effective AS (\r\n",
+        "  SELECT\r\n",
+        "    coalesce(\r\n",
+        "      try_cast(:param_contract_start_date AS DATE),\r\n",
+        "      ac.contract_start_date,\r\n",
+        "      try_cast(:param_start_date AS DATE)\r\n",
+        "    ) AS contract_start_date,\r\n",
+        "    coalesce(\r\n",
+        "      ac.contract_end_date,\r\n",
+        "      try_cast(:param_end_date AS DATE),\r\n",
+        "      current_date()\r\n",
+        "    ) AS contract_end_date,\r\n",
+        "    ac.budget_usd AS budget_usd,\r\n",
+        "    ac.threshold_usd AS threshold_usd\r\n",
+        "  FROM (SELECT 1) d\r\n",
+        "  LEFT JOIN account_contract ac ON 1=1\r\n",
+        "),\r\n",
+        "\r\n",
+        "-- 5) usageログ（全ワークスペース）\r\n",
+        "usage_filtered AS (\r\n",
+        "  SELECT\r\n",
+        "    u.workspace_id,\r\n",
+        "    u.usage_date,\r\n",
+        "    u.usage_usd\r\n",
+        "  FROM audit_validation.usage_schema.ws_usage_filtered u\r\n",
+        "  CROSS JOIN effective e\r\n",
+        "  CROSS JOIN param_ws p\r\n",
+        "  LEFT JOIN target_workspace tw ON TRUE\r\n",
+        "  WHERE u.usage_date BETWEEN e.contract_start_date AND e.contract_end_date\r\n",
+        "    AND (\r\n",
+        "      :param_workspace IS NULL\r\n",
+        "      OR :param_workspace IN (\r\n",
+        "        '<ALL WORKSPACES>','ALL WORKSPACES','ALL WORKSPACE',\r\n",
+        "        '<ALL WORKSPACE>','全ワークスペース','すべて','ALL-WORKSPACE'\r\n",
+        "      )\r\n",
+        "      OR u.workspace_id = tw.workspace_id\r\n",
+        "    )\r\n",
+        "),\r\n",
+        "\r\n",
+        "-- 6) 粒度別日付カラム生成\r\n",
+        "usage_with_periods AS (\r\n",
+        "  SELECT\r\n",
+        "    workspace_id,\r\n",
+        "    date_trunc(\r\n",
+        "      CASE\r\n",
+        "        WHEN :param_time_key = '月'   THEN 'MONTH'\r\n",
+        "        WHEN :param_time_key = '週'    THEN 'WEEK'\r\n",
+        "        ELSE 'DAY'\r\n",
+        "      END, usage_date\r\n",
+        "    ) AS period,\r\n",
+        "    usage_usd\r\n",
+        "  FROM usage_filtered\r\n",
+        "),\r\n",
+        "\r\n",
+        "-- 7) 期間別金額集計（ワークスペースごと）\r\n",
+        "by_period AS (\r\n",
+        "  SELECT\r\n",
+        "    workspace_id,\r\n",
+        "    period,\r\n",
+        "    SUM(usage_usd) AS usage_usd\r\n",
+        "  FROM usage_with_periods\r\n",
+        "  GROUP BY workspace_id, period\r\n",
+        "),\r\n",
+        "\r\n",
+        "-- 8) 累積（ワークスペースごと）\r\n",
+        "series AS (\r\n",
+        "  SELECT\r\n",
+        "    workspace_id,\r\n",
+        "    period,\r\n",
+        "    usage_usd,\r\n",
+        "    SUM(usage_usd) OVER (\r\n",
+        "      PARTITION BY workspace_id\r\n",
+        "      ORDER BY period\r\n",
+        "      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\r\n",
+        "    ) AS cumulative_usd\r\n",
+        "  FROM by_period\r\n",
+        "),\r\n",
+        "\r\n",
+        "-- 9) 最終整形\r\n",
+        "final AS (\r\n",
+        "  SELECT\r\n",
+        "    workspace_id AS `workspace_id`,\r\n",
+        "    CASE\r\n",
+        "      WHEN :param_time_key = '月'   THEN date_format(period, 'yyyy年MM月')\r\n",
+        "      WHEN :param_time_key = '週'    THEN concat(\r\n",
+        "        date_format(period, 'yyyy年MM月dd日'),\r\n",
+        "        '〜',\r\n",
+        "        date_format(date_add(period, 6), 'MM月dd日')\r\n",
+        "      )\r\n",
+        "      ELSE date_format(period, 'yyyy年MM月dd日')\r\n",
+        "    END AS `期間`,\r\n",
+        "    usage_usd          AS `当期間利用料_USD`,\r\n",
+        "    cumulative_usd     AS `契約開始からの累積利用料_USD`,\r\n",
+        "    e.threshold_usd    AS `予算閾値_USD`,\r\n",
+        "    e.budget_usd       AS `予算値_USD`,\r\n",
+        "    CASE WHEN e.threshold_usd IS NOT NULL AND cumulative_usd > e.threshold_usd THEN TRUE ELSE FALSE END AS `閾値超過有無`,\r\n",
+        "    CASE WHEN e.budget_usd IS NOT NULL AND cumulative_usd > e.budget_usd THEN TRUE ELSE FALSE END AS `予算超過有無`,\r\n",
+        "    CASE WHEN (cumulative_usd - e.threshold_usd) > 0 THEN (cumulative_usd - e.threshold_usd) ELSE 0 END AS `閾値超過額_USD`,\r\n",
+        "    CASE WHEN (cumulative_usd - e.budget_usd) > 0 THEN (cumulative_usd - e.budget_usd) ELSE 0 END AS `予算超過額_USD`\r\n",
+        "  FROM series\r\n",
+        "  CROSS JOIN effective e\r\n",
+        ")\r\n",
+        "SELECT *\r\n",
+        "FROM final\r\n",
+        "ORDER BY `期間`, `workspace_id`;"
+      ],
+      "parameters": [
+        {
+          "displayName": "param_workspace",
+          "keyword": "param_workspace",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": "<ALL WORKSPACES>"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "param_end_date",
+          "keyword": "param_end_date",
+          "dataType": "DATE",
+          "defaultSelection": {
+            "values": {
+              "dataType": "DATE",
+              "values": [
+                {
+                  "value": "now/d"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "param_contract_start_date",
+          "keyword": "param_contract_start_date",
+          "dataType": "DATE",
+          "defaultSelection": {
+            "values": {
+              "dataType": "DATE",
+              "values": [
+                {
+                  "value": "now-12M/M"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "param_start_date",
+          "keyword": "param_start_date",
+          "dataType": "DATE",
+          "defaultSelection": {
+            "values": {
+              "dataType": "DATE",
+              "values": [
+                {
+                  "value": "now-6M/M"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "param_time_key",
+          "keyword": "param_time_key",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": "月"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "f43352cc",
+      "displayName": "billing_originproduct_and_sku_graph",
+      "queryLines": [
+        "WITH\r\n",
+        "-- 0) workspaceパラメータ判定（個別指定は workspace_name 想定）\r\n",
+        "param_ws AS (\r\n",
+        "  SELECT\r\n",
+        "    CASE\r\n",
+        "      WHEN :param_workspace IS NULL\r\n",
+        "        OR :param_workspace = '<ALL WORKSPACES>' THEN NULL\r\n",
+        "      ELSE :param_workspace \r\n",
+        "    END AS ws_name\r\n",
+        "),\r\n",
+        "\r\n",
+        "-- 2) workspace_name → workspace_id を create_time 最新で一意化（同名・別IDの履歴対策）\r\n",
+        "workspace_master_latest_by_name AS (\r\n",
+        "  SELECT workspace_name, workspace_id\r\n",
+        "  FROM (\r\n",
+        "    SELECT\r\n",
+        "      workspace_name,\r\n",
+        "      workspace_id,\r\n",
+        "      create_time,\r\n",
+        "      ROW_NUMBER() OVER (\r\n",
+        "        PARTITION BY workspace_name\r\n",
+        "        ORDER BY create_time DESC\r\n",
+        "      ) AS rn\r\n",
+        "    FROM audit_validation.budget_schema.usage_account_workspace_name\r\n",
+        "    WHERE workspace_name IS NOT NULL\r\n",
+        "      AND workspace_id IS NOT NULL\r\n",
+        "  )\r\n",
+        "  WHERE rn = 1\r\n",
+        "),\r\n",
+        "-- 3) 指定された workspace_name に対応する workspace_id を最大1件にする\r\n",
+        "target_workspace AS (\r\n",
+        "  SELECT  DISTINCT wm.workspace_id, wm.workspace_name\r\n",
+        "  FROM workspace_master_latest_by_name wm\r\n",
+        "  CROSS JOIN param_ws p\r\n",
+        "  WHERE p.ws_name IS NOT NULL\r\n",
+        "    AND wm.workspace_name = p.ws_name\r\n",
+        "),\r\n",
+        "\r\n",
+        "-- 1) usage取得（期間フィルタ＋workspace_nameパラメータ適用）\r\n",
+        "usage_filtered_by_date AS (\r\n",
+        "  SELECT\r\n",
+        "    u.workspace_id,\r\n",
+        "    tw.workspace_name,\r\n",
+        "    u.usage_date,\r\n",
+        "    u.usage_usd,\r\n",
+        "    u.sku_name,\r\n",
+        "    u.billing_origin_product\r\n",
+        "  FROM audit_validation.usage_schema.ws_usage_filtered AS u\r\n",
+        "  CROSS JOIN param_ws p\r\n",
+        "  LEFT  JOIN target_workspace tw ON TRUE\r\n",
+        "  WHERE u.usage_date BETWEEN :param_start_date AND :param_end_date\r\n",
+        "    AND (\r\n",
+        "      p.ws_name IS NULL                 -- ALL / 未指定 → 絞らない\r\n",
+        "      OR u.workspace_id = tw.workspace_id  -- 個別指定 → 一意化したworkspace_idで絞る\r\n",
+        "    )\r\n",
+        "),\r\n",
+        "\r\n",
+        "-- 粒度カラムを追加\r\n",
+        "usage_with_periods AS (\r\n",
+        "  SELECT *,\r\n",
+        "         date_trunc('MONTH',   usage_date) AS usage_month,\r\n",
+        "         date_trunc('WEEK',    usage_date) AS usage_week\r\n",
+        "  FROM usage_filtered_by_date\r\n",
+        "),\r\n",
+        "\r\n",
+        "-- 集計用キー\r\n",
+        "list_priced_usd_with_time_key AS (\r\n",
+        "  SELECT CASE\r\n",
+        "           WHEN :param_time_key = '月'   THEN usage_month\r\n",
+        "           WHEN :param_time_key = '週'    THEN usage_week\r\n",
+        "           ELSE usage_date\r\n",
+        "         END AS period_key,\r\n",
+        "         usage_usd,\r\n",
+        "         workspace_id,\r\n",
+        "         workspace_name,\r\n",
+        "         sku_name,\r\n",
+        "         billing_origin_product\r\n",
+        "  FROM usage_with_periods\r\n",
+        "),\r\n",
+        "\r\n",
+        "\r\n",
+        "\r\n",
+        "ws_count AS (\r\n",
+        "  SELECT count(DISTINCT(workspace_id)) AS workspace_count\r\n",
+        "  FROM list_priced_usd_with_time_key\r\n",
+        "),\r\n",
+        "top_workspace_usage AS (\r\n",
+        "  SELECT workspace_id AS top_workspace, workspace_name, SUM(usage_usd) AS _top_ws_usage_usd\r\n",
+        "  FROM list_priced_usd_with_time_key\r\n",
+        "  GROUP BY workspace_id,workspace_name\r\n",
+        "  ORDER BY _top_ws_usage_usd DESC\r\n",
+        "  LIMIT 10\r\n",
+        "),\r\n",
+        "\r\n",
+        "-- グルーピングキー設定\r\n",
+        "with_group_keys AS (\r\n",
+        "  SELECT IF(workspace_count <= 50 OR u.workspace_id IS NULL OR top_workspace IS NOT NULL,\r\n",
+        "            wn.workspace_name, '<OTHERS>') AS workspace_norm,\r\n",
+        "         CASE\r\n",
+        "           WHEN :param_group_key = 'ワークスペース別' THEN workspace_norm\r\n",
+        "           WHEN :param_group_key = 'SKU別'       THEN sku_name\r\n",
+        "           ELSE billing_origin_product\r\n",
+        "         END AS group_key,\r\n",
+        "         *\r\n",
+        "  FROM ws_count, list_priced_usd_with_time_key u\r\n",
+        "  LEFT JOIN top_workspace_usage tw\r\n",
+        "    ON u.workspace_id = tw.top_workspace\r\n",
+        "  LEFT JOIN workspace_master_latest_by_name wn\r\n",
+        "    ON u.workspace_id = wn.workspace_id\r\n",
+        "),\r\n",
+        "\r\n",
+        "-- -- 期間＋グループ別使用量集計\r\n",
+        "grouped_usage_by_period AS (\r\n",
+        "  SELECT period_key,\r\n",
+        "         replace(replace(group_key, '<', '&lt;'), '>', '&gt;') AS group_key,\r\n",
+        "         SUM(usage_usd) AS usage_usd\r\n",
+        "  FROM with_group_keys\r\n",
+        "  WHERE group_key IS NOT NULL\r\n",
+        "  GROUP BY period_key, group_key\r\n",
+        ")\r\n",
+        "\r\n",
+        "SELECT\r\n",
+        "  date_trunc(\r\n",
+        "      CASE\r\n",
+        "        WHEN :param_time_key = '月' THEN 'month'\r\n",
+        "        WHEN :param_time_key = '週' THEN 'week'\r\n",
+        "        ELSE 'day'\r\n",
+        "      END,\r\n",
+        "      period_key\r\n",
+        "    ) AS display_date,\r\n",
+        "  group_key,\r\n",
+        "  usage_usd\r\n",
+        "FROM grouped_usage_by_period\r\n",
+        ";"
+      ],
+      "parameters": [
+        {
+          "displayName": "param_start_date",
+          "keyword": "param_start_date",
+          "dataType": "DATE",
+          "defaultSelection": {
+            "values": {
+              "dataType": "DATE",
+              "values": [
+                {
+                  "value": "now-12M/M"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "param_end_date",
+          "keyword": "param_end_date",
+          "dataType": "DATE",
+          "defaultSelection": {
+            "values": {
+              "dataType": "DATE",
+              "values": [
+                {
+                  "value": "now/d"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "param_workspace",
+          "keyword": "param_workspace",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": "<ALL WORKSPACES>"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "param_time_key",
+          "keyword": "param_time_key",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": "週"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "param_group_key",
+          "keyword": "param_group_key",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": "ワークスペース別"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "7bc1d82b",
+      "displayName": "cumulative_usage_table",
+      "queryLines": [
+        "WITH\r\n",
+        "-- 0) workspaceパラメータ判定（個別指定は workspace_name 想定）\r\n",
+        "param_ws AS (\r\n",
+        "  SELECT\r\n",
+        "    CASE\r\n",
+        "      WHEN :param_workspace IS NULL\r\n",
+        "        OR :param_workspace IN (\r\n",
+        "          '<ALL WORKSPACES>', 'ALL WORKSPACES', 'ALL WORKSPACE', '<ALL WORKSPACE>',\r\n",
+        "          '全ワークスペース', 'すべて', 'ALL-WORKSPACE'\r\n",
+        "        )\r\n",
+        "      THEN NULL\r\n",
+        "      ELSE :param_workspace \r\n",
+        "    END AS ws_id\r\n",
+        "),\r\n",
+        "\r\n",
+        "-- 0.1) workspace_name → workspace_id を create_time 最新で一意化\r\n",
+        "workspace_master_latest_by_name AS (\r\n",
+        "  SELECT workspace_name, workspace_id\r\n",
+        "  FROM (\r\n",
+        "    SELECT\r\n",
+        "      workspace_name,\r\n",
+        "      workspace_id,\r\n",
+        "      create_time,\r\n",
+        "      ROW_NUMBER() OVER (\r\n",
+        "        PARTITION BY workspace_name\r\n",
+        "        ORDER BY create_time DESC\r\n",
+        "      ) AS rn\r\n",
+        "    FROM audit_validation.budget_schema.usage_account_workspace_name\r\n",
+        "    WHERE workspace_name IS NOT NULL\r\n",
+        "  )\r\n",
+        "  WHERE rn = 1\r\n",
+        "),\r\n",
+        "\r\n",
+        "-- 0.2) 指定された workspace_name に対応する workspace_id を最大1件にする\r\n",
+        "target_workspace AS (\r\n",
+        "  SELECT wm.workspace_id\r\n",
+        "  FROM workspace_master_latest_by_name wm\r\n",
+        "  CROSS JOIN param_ws p\r\n",
+        "  WHERE p.ws_id IS NOT NULL\r\n",
+        "    AND wm.workspace_id = p.ws_id\r\n",
+        "),\r\n",
+        "\r\n",
+        "-- 1) usage取得（期間フィルタ＋workspaceパラメータ適用）\r\n",
+        "usage_filtered AS (\r\n",
+        "  SELECT\r\n",
+        "    u.workspace_id,\r\n",
+        "    u.usage_date,\r\n",
+        "    u.usage_usd\r\n",
+        "  FROM audit_validation.usage_schema.ws_usage_filtered u\r\n",
+        "  CROSS JOIN param_ws p\r\n",
+        "  LEFT  JOIN target_workspace tw ON TRUE\r\n",
+        "  WHERE u.usage_date BETWEEN :param_start_date AND :param_end_date\r\n",
+        "    AND (\r\n",
+        "      p.ws_id IS NULL                  -- ALL指定なら全ワークスペース\r\n",
+        "      OR u.workspace_id = tw.workspace_id  -- 個別指定なら（一意化した）ID一致\r\n",
+        "    )\r\n",
+        "),\r\n",
+        "\r\n",
+        "-- 粒度別 period 列生成＆利用料集計（全ワークスペース分 or 絞り込み後）\r\n",
+        "usage_with_period AS (\r\n",
+        "  SELECT\r\n",
+        "    CASE\r\n",
+        "      WHEN :param_time_key = '月'   THEN date_trunc('MONTH', usage_date)\r\n",
+        "      WHEN :param_time_key = '週'    THEN date_trunc('WEEK', usage_date)\r\n",
+        "      ELSE usage_date\r\n",
+        "    END AS period,\r\n",
+        "    SUM(usage_usd) AS usage_usd\r\n",
+        "  FROM usage_filtered\r\n",
+        "  GROUP BY 1\r\n",
+        "),\r\n",
+        "\r\n",
+        "-- 全ワークスペース（or 絞り込み後）累積利用料\r\n",
+        "usage_with_cumulative AS (\r\n",
+        "  SELECT\r\n",
+        "    period,\r\n",
+        "    SUM(usage_usd) OVER (\r\n",
+        "      ORDER BY period\r\n",
+        "      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\r\n",
+        "    ) AS cumulative_usd\r\n",
+        "  FROM usage_with_period\r\n",
+        ")\r\n",
+        "\r\n",
+        "SELECT\r\n",
+        "  CASE\r\n",
+        "    WHEN :param_time_key = '月'   THEN date_format(period, 'yyyy年MM月')\r\n",
+        "    WHEN :param_time_key = '週'    THEN concat(\r\n",
+        "      date_format(period, 'yyyy年MM月dd日'),\r\n",
+        "      '〜',\r\n",
+        "      date_format(date_add(period, 6), 'MM月dd日')\r\n",
+        "    )\r\n",
+        "    ELSE date_format(period, 'yyyy年MM月dd日')\r\n",
+        "  END AS period_ja,\r\n",
+        "  cumulative_usd\r\n",
+        "FROM usage_with_cumulative\r\n",
+        "ORDER BY period;"
+      ],
+      "parameters": [
+        {
+          "displayName": "param_workspace",
+          "keyword": "param_workspace",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": "<ALL WORKSPACES>"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "param_time_key",
+          "keyword": "param_time_key",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": "月"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "param_start_date",
+          "keyword": "param_start_date",
+          "dataType": "DATE",
+          "defaultSelection": {
+            "values": {
+              "dataType": "DATE",
+              "values": [
+                {
+                  "value": "now-12M/M"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "param_end_date",
+          "keyword": "param_end_date",
+          "dataType": "DATE",
+          "defaultSelection": {
+            "values": {
+              "dataType": "DATE",
+              "values": [
+                {
+                  "value": "now-1d/d"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "e958046b",
+      "displayName": "cumulative_usage",
+      "queryLines": [
+        "WITH \r\n",
+        "-- 0) workspaceパラメータ判定（個別指定は workspace_name 想定）\r\n",
+        "param_ws AS (\r\n",
+        "  SELECT\r\n",
+        "    CASE\r\n",
+        "      WHEN :param_workspace IS NULL\r\n",
+        "        OR :param_workspace = '<ALL WORKSPACES>' THEN NULL\r\n",
+        "      ELSE :param_workspace \r\n",
+        "    END AS ws_name\r\n",
+        "),\r\n",
+        "-- 1) workspace_name → workspace_id を create_time 最新で一意化\r\n",
+        "workspace_master_latest_by_name AS (\r\n",
+        "  SELECT workspace_name, workspace_id\r\n",
+        "  FROM (\r\n",
+        "    SELECT\r\n",
+        "      workspace_name,\r\n",
+        "      workspace_id,\r\n",
+        "      create_time,\r\n",
+        "      ROW_NUMBER() OVER (PARTITION BY workspace_name ORDER BY create_time DESC) AS rn\r\n",
+        "    FROM audit_validation.budget_schema.usage_account_workspace_name\r\n",
+        "    WHERE workspace_name IS NOT NULL\r\n",
+        "      AND workspace_id IS NOT NULL\r\n",
+        "  )\r\n",
+        "  WHERE rn = 1\r\n",
+        "),\r\n",
+        "-- 2) 指定された workspace_name に対応する workspace_id を取得\r\n",
+        "target_workspace AS (\r\n",
+        "  SELECT DISTINCT wm.workspace_id, wm.workspace_name\r\n",
+        "  FROM workspace_master_latest_by_name wm\r\n",
+        "  CROSS JOIN param_ws p\r\n",
+        "  WHERE p.ws_name IS NOT NULL\r\n",
+        "    AND wm.workspace_name = p.ws_name\r\n",
+        "),\r\n",
+        "-- 3) アカウントレベルの予算・契約情報を取得（最新のレコードのみ）\r\n",
+        "account_contract AS (\r\n",
+        "  SELECT\r\n",
+        "    contract_id,\r\n",
+        "    budget_usd AS total_budget_usd,\r\n",
+        "    threshold_usd AS total_threshold_usd,\r\n",
+        "    contract_start_date,\r\n",
+        "    contract_end_date\r\n",
+        "  FROM audit_validation.budget_schema.account_budget_contracts\r\n",
+        "  WHERE updated_at = (\r\n",
+        "    SELECT MAX(updated_at) FROM audit_validation.budget_schema.account_budget_contracts\r\n",
+        "  )\r\n",
+        "),\r\n",
+        "-- 4) 利用料集計（アカウント契約期間内のデータを取得）\r\n",
+        "usage_aggregated AS (\r\n",
+        "  SELECT\r\n",
+        "    date_trunc(\r\n",
+        "      CASE\r\n",
+        "        WHEN :param_time_key = '月' THEN 'month'\r\n",
+        "        WHEN :param_time_key = '週' THEN 'week'\r\n",
+        "        ELSE 'day'\r\n",
+        "      END,\r\n",
+        "      u.usage_date\r\n",
+        "    ) AS display_date,\r\n",
+        "    ac.contract_id,\r\n",
+        "    SUM(u.usage_usd) AS period_usage_usd\r\n",
+        "  FROM audit_validation.usage_schema.ws_usage_filtered u\r\n",
+        "  CROSS JOIN account_contract ac\r\n",
+        "  LEFT JOIN target_workspace tw ON u.workspace_id = tw.workspace_id\r\n",
+        "  WHERE u.usage_date BETWEEN ac.contract_start_date AND ac.contract_end_date\r\n",
+        "    AND (\r\n",
+        "      :param_workspace IS NULL\r\n",
+        "      OR :param_workspace = '<ALL WORKSPACES>'\r\n",
+        "      OR tw.workspace_name = :param_workspace\r\n",
+        "    )\r\n",
+        "  GROUP BY 1, 2\r\n",
+        "),\r\n",
+        "-- 5) 累積利用料集計\r\n",
+        "final_data AS (\r\n",
+        "  SELECT\r\n",
+        "    u.display_date,\r\n",
+        "    date_format(u.display_date, 'yyyy年MM月dd日') AS date_str,\r\n",
+        "    CASE WHEN :param_workspace = '<ALL WORKSPACES>' THEN 'All Workspaces' ELSE :param_workspace END AS display_name,\r\n",
+        "    u.contract_id,\r\n",
+        "    CAST(SUM(u.period_usage_usd) OVER (\r\n",
+        "      ORDER BY u.display_date ASC\r\n",
+        "    ) AS double) AS cumulative_usage_usd,\r\n",
+        "    ac.total_budget_usd,\r\n",
+        "    ac.total_threshold_usd\r\n",
+        "  FROM usage_aggregated u\r\n",
+        "  CROSS JOIN account_contract ac\r\n",
+        "  ORDER BY display_date ASC\r\n",
+        ")\r\n",
+        "-- 6) 可視化対象\r\n",
+        "SELECT * \r\n",
+        "FROM final_data f\r\n",
+        "WHERE f.display_date BETWEEN :param_start_date AND :param_end_date\r\n",
+        ";\r\n"
+      ],
+      "parameters": [
+        {
+          "displayName": "param_workspace",
+          "keyword": "param_workspace",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": "dbw-hhhd-lab-mask-dev"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "param_time_key",
+          "keyword": "param_time_key",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": "月"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "param_start_date",
+          "keyword": "param_start_date",
+          "dataType": "DATE",
+          "defaultSelection": {
+            "values": {
+              "dataType": "DATE",
+              "values": [
+                {
+                  "value": "now-1M/M"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "param_end_date",
+          "keyword": "param_end_date",
+          "dataType": "DATE",
+          "defaultSelection": {
+            "values": {
+              "dataType": "DATE",
+              "values": [
+                {
+                  "value": "now-1d/d"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "543b10a2",
+      "displayName": "billing_originproduct_and_sku_table",
+      "queryLines": [
+        "WITH\r\n",
+        "-- 0) workspaceパラメータ判定（個別指定は workspace_name 想定）\r\n",
+        "param_ws AS (\r\n",
+        "  SELECT\r\n",
+        "    CASE\r\n",
+        "      WHEN :param_workspace IS NULL\r\n",
+        "        OR :param_workspace = '<ALL WORKSPACES>' THEN NULL\r\n",
+        "      ELSE :param_workspace \r\n",
+        "    END AS ws_name\r\n",
+        "),\r\n",
+        "\r\n",
+        "-- 2) workspace_name → workspace_id を create_time 最新で一意化（同名・別IDの履歴対策）\r\n",
+        "workspace_master_latest_by_name AS (\r\n",
+        "  SELECT workspace_name, workspace_id\r\n",
+        "  FROM (\r\n",
+        "    SELECT\r\n",
+        "      workspace_name,\r\n",
+        "      workspace_id,\r\n",
+        "      create_time,\r\n",
+        "      ROW_NUMBER() OVER (\r\n",
+        "        PARTITION BY workspace_name\r\n",
+        "        ORDER BY create_time DESC\r\n",
+        "      ) AS rn\r\n",
+        "    FROM audit_validation.budget_schema.usage_account_workspace_name\r\n",
+        "    WHERE workspace_name IS NOT NULL\r\n",
+        "      AND workspace_id IS NOT NULL\r\n",
+        "  )\r\n",
+        "  WHERE rn = 1\r\n",
+        "),\r\n",
+        "-- 3) 指定された workspace_name に対応する workspace_id を最大1件にする\r\n",
+        "target_workspace AS (\r\n",
+        "  SELECT  DISTINCT wm.workspace_id, wm.workspace_name\r\n",
+        "  FROM workspace_master_latest_by_name wm\r\n",
+        "  CROSS JOIN param_ws p\r\n",
+        "  WHERE p.ws_name IS NOT NULL\r\n",
+        "    AND wm.workspace_name = p.ws_name\r\n",
+        "),\r\n",
+        "\r\n",
+        "-- 1) usage取得（期間フィルタ＋workspace_nameパラメータ適用）\r\n",
+        "usage_filtered_by_date AS (\r\n",
+        "  SELECT\r\n",
+        "    u.workspace_id,\r\n",
+        "    tw.workspace_name,\r\n",
+        "    u.usage_date,\r\n",
+        "    u.usage_usd,\r\n",
+        "    u.sku_name,\r\n",
+        "    u.billing_origin_product\r\n",
+        "  FROM audit_validation.usage_schema.ws_usage_filtered AS u\r\n",
+        "  CROSS JOIN param_ws p\r\n",
+        "  LEFT  JOIN target_workspace tw ON TRUE\r\n",
+        "  WHERE u.usage_date BETWEEN :param_start_date AND :param_end_date\r\n",
+        "    AND (\r\n",
+        "      p.ws_name IS NULL                 -- ALL / 未指定 → 絞らない\r\n",
+        "      OR u.workspace_id = tw.workspace_id  -- 個別指定 → 一意化したworkspace_idで絞る\r\n",
+        "    )\r\n",
+        "),\r\n",
+        "\r\n",
+        "-- 粒度カラムを追加\r\n",
+        "usage_with_periods AS (\r\n",
+        "  SELECT *,\r\n",
+        "         date_trunc('MONTH',   usage_date) AS usage_month,\r\n",
+        "         date_trunc('WEEK',    usage_date) AS usage_week\r\n",
+        "  FROM usage_filtered_by_date\r\n",
+        "),\r\n",
+        "\r\n",
+        "-- 集計用キー\r\n",
+        "list_priced_usd_with_time_key AS (\r\n",
+        "  SELECT CASE\r\n",
+        "           WHEN :param_time_key = '月'   THEN usage_month\r\n",
+        "           WHEN :param_time_key = '週'    THEN usage_week\r\n",
+        "           ELSE usage_date\r\n",
+        "         END AS period_key,\r\n",
+        "         usage_usd,\r\n",
+        "         workspace_id,\r\n",
+        "         workspace_name,\r\n",
+        "         sku_name,\r\n",
+        "         billing_origin_product\r\n",
+        "  FROM usage_with_periods\r\n",
+        "),\r\n",
+        "\r\n",
+        "ws_count AS (\r\n",
+        "  SELECT count(DISTINCT(workspace_id)) AS workspace_count\r\n",
+        "  FROM list_priced_usd_with_time_key\r\n",
+        "),\r\n",
+        "top_workspace_usage AS (\r\n",
+        "  SELECT workspace_id AS top_workspace, workspace_name, SUM(usage_usd) AS _top_ws_usage_usd\r\n",
+        "  FROM list_priced_usd_with_time_key\r\n",
+        "  GROUP BY workspace_id,workspace_name\r\n",
+        "  ORDER BY _top_ws_usage_usd DESC\r\n",
+        "  LIMIT 10\r\n",
+        "),\r\n",
+        "list_priced_usd_with_time_and_group_keys as (\r\n",
+        "  select\r\n",
+        "    if(workspace_count <= 50 or u.workspace_id is null or top_workspace is not null, u.workspace_id, '<OTHERS>') as workspace_norm,\r\n",
+        "    identifier\r\n",
+        "    (\r\n",
+        "      case\r\n",
+        "        when :param_group_key = 'ワークスペース別' then 'workspace_norm'\r\n",
+        "        when :param_group_key = 'SKU別' then 'sku_name'\r\n",
+        "        else 'billing_origin_product'\r\n",
+        "      end\r\n",
+        "    ) as group_key,\r\n",
+        "    *\r\n",
+        "  from ws_count, list_priced_usd_with_time_key u\r\n",
+        "  left join top_workspace_usage\r\n",
+        "    on u.workspace_name = top_workspace_usage.top_workspace\r\n",
+        "),\r\n",
+        "-- 集計処理\r\n",
+        "grouped_usage_by_period as (\r\n",
+        "  select\r\n",
+        "    period_key,\r\n",
+        "    replace(replace(group_key, '<', '&lt;'), '>', '&gt;') as group_key,\r\n",
+        "    sum(usage_usd) as usage_usd\r\n",
+        "  from list_priced_usd_with_time_and_group_keys\r\n",
+        "  group by all\r\n",
+        "),\r\n",
+        "-- (中略：ピボットや表示整形ロジックは構造を維持)\r\n",
+        "grouped_usage_change as (\r\n",
+        "  select\r\n",
+        "    period_key,\r\n",
+        "    group_key,\r\n",
+        "    usage_usd,\r\n",
+        "    lag(usage_usd, 1) over (partition by group_key order by period_key) as prev_usage_usd,\r\n",
+        "    round(try_divide(usage_usd - prev_usage_usd, prev_usage_usd) * 100, 2) as usage_change_percentage\r\n",
+        "  from grouped_usage_by_period\r\n",
+        "),\r\n",
+        "total_usage_change as (\r\n",
+        "  select\r\n",
+        "    period_key,\r\n",
+        "    '<b>TOTAL</b>' as group_key,\r\n",
+        "    sum(usage_usd) as usage_usd,\r\n",
+        "    lag(sum(usage_usd), 1) over (order by period_key) as prev_usage_usd,\r\n",
+        "    round(try_divide(sum(usage_usd) - prev_usage_usd, prev_usage_usd) * 100, 2) as usage_change_percentage\r\n",
+        "  from grouped_usage_by_period\r\n",
+        "  group by period_key\r\n",
+        "),\r\n",
+        "period_info as (\r\n",
+        "  select\r\n",
+        "    case\r\n",
+        "      when :param_time_key = '日' then current_date()\r\n",
+        "      when :param_time_key = '週' then date_trunc('WEEK', current_date())\r\n",
+        "      when :param_time_key = '月' then date_trunc('MONTH', current_date())\r\n",
+        "    end as current_period,\r\n",
+        "    case\r\n",
+        "      when :param_time_key = '日' then current_date() - interval 1 day\r\n",
+        "      when :param_time_key = '週' then date_trunc('WEEK', current_date() - interval 7 day)\r\n",
+        "      when :param_time_key = '月' then date_trunc('MONTH', current_date() - interval 1 month)\r\n",
+        "    end as last_period,\r\n",
+        "    case\r\n",
+        "      when :param_time_key = '日' then current_date() - interval 2 day\r\n",
+        "      when :param_time_key = '週' then date_trunc('WEEK', current_date() - interval 14 day)\r\n",
+        "      when :param_time_key = '月' then date_trunc('MONTH', current_date() - interval 2 month)\r\n",
+        "    end as 2_periods_ago,\r\n",
+        "    case\r\n",
+        "      when :param_time_key = '日' then current_date() - interval 3 day\r\n",
+        "      when :param_time_key = '週' then date_trunc('WEEK', current_date() - interval 21 day)\r\n",
+        "      when :param_time_key = '月' then date_trunc('MONTH', current_date() - interval 3 month)\r\n",
+        "    end as 3_periods_ago,\r\n",
+        "    case\r\n",
+        "      when :param_time_key = '日' then current_date() - interval 4 day\r\n",
+        "      when :param_time_key = '週' then date_trunc('WEEK', current_date() - interval 28 day)\r\n",
+        "      when :param_time_key = '月' then date_trunc('MONTH', current_date() - interval 4 month)\r\n",
+        "    end as 4_periods_ago,\r\n",
+        "    case\r\n",
+        "      when :param_time_key = '日' then current_date() - interval 5 day\r\n",
+        "      when :param_time_key = '週' then date_trunc('WEEK', current_date() - interval 35 day)\r\n",
+        "      when :param_time_key = '月' then date_trunc('MONTH', current_date() - interval 5 month)\r\n",
+        "    end as 5_periods_ago\r\n",
+        "),\r\n",
+        "usage_change_pivot as (\r\n",
+        "  select\r\n",
+        "    case\r\n",
+        "      when period_key = current_period then 'Current period'\r\n",
+        "      when period_key = last_period then 'Last period'\r\n",
+        "      when period_key = 2_periods_ago then '2 periods ago'\r\n",
+        "      when period_key = 3_periods_ago then '3 periods ago'\r\n",
+        "      when period_key = 4_periods_ago then '4 periods ago'\r\n",
+        "      when period_key = 5_periods_ago then '5 periods ago'\r\n",
+        "    end as x_period_back,\r\n",
+        "    group_key,\r\n",
+        "    usage_usd,\r\n",
+        "    usage_change_percentage\r\n",
+        "  from (\r\n",
+        "    select * from grouped_usage_change, period_info\r\n",
+        "    union all\r\n",
+        "    select * from total_usage_change, period_info\r\n",
+        "  )\r\n",
+        "),\r\n",
+        "all_time_usage_pivot as (\r\n",
+        "  select\r\n",
+        "    'Start to End date' as x_period_back,\r\n",
+        "    group_key,\r\n",
+        "    sum(usage_usd) as usage_usd,\r\n",
+        "    null as usage_change_percentage\r\n",
+        "  from grouped_usage_by_period\r\n",
+        "  group by group_key\r\n",
+        "),\r\n",
+        "all_time_total_usage_pivot as (\r\n",
+        "  select\r\n",
+        "    'Start to End date' as x_period_back,\r\n",
+        "    '<b>TOTAL</b>' as group_key,\r\n",
+        "    sum(usage_usd) as usage_usd,\r\n",
+        "    null as usage_change_percentage\r\n",
+        "  from grouped_usage_by_period\r\n",
+        "),\r\n",
+        "union_usage_pivot as (\r\n",
+        "  select\r\n",
+        "    x_period_back,\r\n",
+        "    group_key,\r\n",
+        "    case\r\n",
+        "      when x_period_back = 'Start to End date' then string(usage_usd)\r\n",
+        "      else concat('<span style=\"zoom:1\">', usage_usd_str, '</span><span style=\"zoom:1;color:', change_color, '\">&nbsp;', usage_change_str, '</span>')\r\n",
+        "    end as usage_info\r\n",
+        "  from (\r\n",
+        "    select\r\n",
+        "      case\r\n",
+        "        when usage_usd >= 1e9 then concat(format_number(usage_usd / 1e9, 0), 'B')\r\n",
+        "        when usage_usd >= 1e6 then concat(format_number(usage_usd / 1e6, 0), 'M')\r\n",
+        "        when usage_usd >= 1e3 then concat(format_number(usage_usd / 1e3, 0), 'K')\r\n",
+        "        else format_number(usage_usd, 0)\r\n",
+        "      end as usage_usd_str,\r\n",
+        "      case\r\n",
+        "        when usage_change_percentage > 10 then '#00A972'\r\n",
+        "        when usage_change_percentage < -10 then '#FF3621'\r\n",
+        "        else '#919191'\r\n",
+        "      end as _change_color,\r\n",
+        "      concat('(', if(usage_change_percentage > 0, '+', ''), format_number(usage_change_percentage, 0), '%)') as _usage_change_str,\r\n",
+        "      coalesce(_change_color, '#919191') as change_color,\r\n",
+        "      coalesce(_usage_change_str, '') as usage_change_str,\r\n",
+        "      *\r\n",
+        "    from (\r\n",
+        "      select x_period_back, group_key, usage_usd, usage_change_percentage from usage_change_pivot\r\n",
+        "      union all\r\n",
+        "      select * from all_time_usage_pivot\r\n",
+        "      union all\r\n",
+        "      select * from all_time_total_usage_pivot\r\n",
+        "    )\r\n",
+        "  )\r\n",
+        ")\r\n",
+        "select\r\n",
+        "  group_key,\r\n",
+        "  concat('$', format_number(float(`Start to End date`), 0)) as `Start to End date`,\r\n",
+        "  float(`Start to End date`) as _all_time_usage_usd,\r\n",
+        "  2 as _order,\r\n",
+        "  coalesce(`5 periods ago`, '<span style=\"zoom:1;color:#919191\">0</span>') as `5 periods ago`,\r\n",
+        "  coalesce(`4 periods ago`, '<span style=\"zoom:1;color:#919191\">0</span>') as `4 periods ago`,\r\n",
+        "  coalesce(`3 periods ago`, '<span style=\"zoom:1;color:#919191\">0</span>') as `3 periods ago`,\r\n",
+        "  coalesce(`2 periods ago`, '<span style=\"zoom:1;color:#919191\">0</span>') as `2 periods ago`,\r\n",
+        "  coalesce(`Last period`, '<span style=\"zoom:1;color:#919191\">0</span>') as `Last period`,\r\n",
+        "  coalesce(`Current period`, '<span style=\"zoom:1;color:#919191\">0</span>') as `Current period`\r\n",
+        "from union_usage_pivot\r\n",
+        "pivot (\r\n",
+        "  first(usage_info)\r\n",
+        "  for x_period_back in (\r\n",
+        "    'Start to End date',\r\n",
+        "    '5 periods ago',\r\n",
+        "    '4 periods ago',\r\n",
+        "    '3 periods ago',\r\n",
+        "    '2 periods ago',\r\n",
+        "    'Last period',\r\n",
+        "    'Current period'\r\n",
+        "  )\r\n",
+        ")\r\n",
+        "union all\r\n",
+        "(\r\n",
+        "  select\r\n",
+        "    concat('<b>',:param_group_key,'</b>') as group_key,\r\n",
+        "    concat('<b><i>', date_format(:param_start_date, 'y年M月d日'), ' - ', date_format(:param_end_date, 'y年M月d日'), '</i></b>') as `Start to End date`,\r\n",
+        "    null as _all_time_usage_usd,\r\n",
+        "    1 as _order,\r\n",
+        "    concat('<b><i>', date_format(5_periods_ago, 'y年M月d日'), ' - ', date_format(4_periods_ago, 'y年M月d日'), '</i></b>') as `5 periods ago`,\r\n",
+        "    concat('<b><i>', date_format(4_periods_ago, 'y年M月d日'), ' - ', date_format(3_periods_ago, 'y年M月d日'), '</i></b>') as `4 periods ago`,\r\n",
+        "    concat('<b><i>', date_format(3_periods_ago, 'y年M月d日'), ' - ', date_format(2_periods_ago, 'y年M月d日'), '</i></b>') as `3 periods ago`,\r\n",
+        "    concat('<b><i>', date_format(2_periods_ago, 'y年M月d日'), ' - ', date_format(last_period, 'y年M月d日'), '</i></b>') as `2 periods ago`,\r\n",
+        "    concat('<b><i>', date_format(last_period, 'y年M月d日'), ' - ', date_format(current_period, 'y年M月d日'), '</i></b>') as `Last period`,\r\n",
+        "    concat('<b><i>', date_format(current_period, 'y年M月d日'), ' - 集計開始日', '</i></b>') as `Current period`\r\n",
+        "  from period_info\r\n",
+        ")\r\n",
+        "order by _order asc, _all_time_usage_usd desc;"
+      ],
+      "parameters": [
+        {
+          "displayName": "param_start_date",
+          "keyword": "param_start_date",
+          "dataType": "DATE",
+          "defaultSelection": {
+            "values": {
+              "dataType": "DATE",
+              "values": [
+                {
+                  "value": "now-90d/d"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "param_end_date",
+          "keyword": "param_end_date",
+          "dataType": "DATE",
+          "defaultSelection": {
+            "values": {
+              "dataType": "DATE",
+              "values": [
+                {
+                  "value": "now-1d/d"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "param_time_key",
+          "keyword": "param_time_key",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": "月"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "param_group_key",
+          "keyword": "param_group_key",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": "SKU別"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "param_workspace",
+          "keyword": "param_workspace",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": "<ALL WORKSPACES>"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "9be49e38",
+      "displayName": "total_usage",
+      "queryLines": [
+        "WITH \r\n",
+        "-- 0) workspaceパラメータ判定（個別指定は workspace_name 想定）\r\n",
+        "param_ws AS (\r\n",
+        "  SELECT\r\n",
+        "    CASE\r\n",
+        "      WHEN :param_workspace IS NULL\r\n",
+        "        OR :param_workspace = '<ALL WORKSPACES>' THEN NULL\r\n",
+        "      ELSE :param_workspace \r\n",
+        "    END AS ws_name\r\n",
+        "),\r\n",
+        "-- 2) workspace_name → workspace_id を create_time 最新で一意化（同名・別IDの履歴対策）\r\n",
+        "workspace_master_latest_by_name AS (\r\n",
+        "  SELECT workspace_name, workspace_id\r\n",
+        "  FROM (\r\n",
+        "    SELECT\r\n",
+        "      workspace_name,\r\n",
+        "      workspace_id,\r\n",
+        "      create_time,\r\n",
+        "      ROW_NUMBER() OVER (PARTITION BY workspace_name ORDER BY create_time DESC) AS rn\r\n",
+        "    FROM audit_validation.budget_schema.usage_account_workspace_name\r\n",
+        "    WHERE workspace_name IS NOT NULL\r\n",
+        "      AND workspace_id IS NOT NULL\r\n",
+        "  )\r\n",
+        "  WHERE rn = 1\r\n",
+        "),\r\n",
+        "\r\n",
+        "-- 3. 指定された workspace_name に対応する workspace_id を最大1件にする\r\n",
+        "target_workspace AS (\r\n",
+        "  SELECT  DISTINCT wm.workspace_id, wm.workspace_name\r\n",
+        "  FROM workspace_master_latest_by_name wm\r\n",
+        "  CROSS JOIN param_ws p\r\n",
+        "  WHERE p.ws_name IS NOT NULL\r\n",
+        "    AND wm.workspace_name = p.ws_name\r\n",
+        "),\r\n",
+        "\r\n",
+        "\r\n",
+        "-- 2. 利用料の集計（target_workspace への依存をパラメータで切り替える）\r\n",
+        "usage_aggregated AS (\r\n",
+        "  SELECT\r\n",
+        "    date_trunc(\r\n",
+        "      CASE \r\n",
+        "        WHEN :param_time_key = '月' THEN 'month'\r\n",
+        "        WHEN :param_time_key = '週' THEN 'week'\r\n",
+        "        ELSE 'day' \r\n",
+        "      END, \r\n",
+        "      u.usage_date\r\n",
+        "    ) AS display_date,\r\n",
+        "    CASE WHEN :param_workspace = '<ALL WORKSPACES>' THEN 'ALL' ELSE CAST(u.workspace_id AS STRING) END AS join_key,\r\n",
+        "    SUM(u.usage_usd) AS period_usage_usd\r\n",
+        "  FROM audit_validation.usage_schema.ws_usage_filtered u\r\n",
+        "  -- ★修正：ALL の時は全ワークスペースを対象にし、個別の時だけ target_workspace で絞り込む\r\n",
+        "  LEFT JOIN target_workspace tw ON u.workspace_id = tw.workspace_id\r\n",
+        "  WHERE (\r\n",
+        "      :param_workspace = '<ALL WORKSPACES>' \r\n",
+        "      -- 個別指定時のみ、名称が一致するものをフィルタ\r\n",
+        "      OR tw.workspace_name = :param_workspace\r\n",
+        "    )\r\n",
+        "  GROUP BY 1, 2\r\n",
+        "),\r\n",
+        "\r\n",
+        "-- 3. 利用料集計\r\n",
+        "final_data as (SELECT\r\n",
+        "  u.display_date,\r\n",
+        "  date_format(u.display_date, 'yyyy年MM月dd日') AS date_str,\r\n",
+        "  CASE WHEN :param_workspace = '<ALL WORKSPACES>' THEN 'All Workspaces' ELSE :param_workspace END AS display_name,\r\n",
+        "  u.period_usage_usd\r\n",
+        "  FROM usage_aggregated u\r\n",
+        "  ORDER BY display_date ASC\r\n",
+        ")\r\n",
+        "-- 4. 可視化対象\r\n",
+        "SELECT * \r\n",
+        "FROM final_data f\r\n",
+        "WHERE f.display_date BETWEEN :param_start_date AND :param_end_date\r\n",
+        ";"
+      ],
+      "parameters": [
+        {
+          "displayName": "param_workspace",
+          "keyword": "param_workspace",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": "<ALL WORKSPACES>"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "param_time_key",
+          "keyword": "param_time_key",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": "日"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "param_start_date",
+          "keyword": "param_start_date",
+          "dataType": "DATE",
+          "defaultSelection": {
+            "values": {
+              "dataType": "DATE",
+              "values": [
+                {
+                  "value": "now-365d/d"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "param_end_date",
+          "keyword": "param_end_date",
+          "dataType": "DATE",
+          "defaultSelection": {
+            "values": {
+              "dataType": "DATE",
+              "values": [
+                {
+                  "value": "now-1d/d"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "9f947c8f",
+      "displayName": "budget_vs_actual_260115",
+      "queryLines": [
+        "WITH \r\n",
+        "-- 0) workspaceパラメータ判定（個別指定は workspace_name 想定）\r\n",
+        "param_ws AS (\r\n",
+        "  SELECT\r\n",
+        "    CASE\r\n",
+        "      WHEN :param_workspace IS NULL\r\n",
+        "        OR :param_workspace = '<ALL WORKSPACES>' THEN NULL\r\n",
+        "      ELSE :param_workspace \r\n",
+        "    END AS ws_name\r\n",
+        "),\r\n",
+        "-- 1) workspace_name → workspace_id を create_time 最新で一意化\r\n",
+        "workspace_master_latest_by_name AS (\r\n",
+        "  SELECT workspace_name, workspace_id\r\n",
+        "  FROM (\r\n",
+        "    SELECT\r\n",
+        "      workspace_name,\r\n",
+        "      workspace_id,\r\n",
+        "      create_time,\r\n",
+        "      ROW_NUMBER() OVER (PARTITION BY workspace_name ORDER BY create_time DESC) AS rn\r\n",
+        "    FROM audit_validation.budget_schema.usage_account_workspace_name\r\n",
+        "    WHERE workspace_name IS NOT NULL\r\n",
+        "      AND workspace_id IS NOT NULL\r\n",
+        "  )\r\n",
+        "  WHERE rn = 1\r\n",
+        "),\r\n",
+        "-- 2) 指定された workspace_name に対応する workspace_id を取得\r\n",
+        "target_workspace AS (\r\n",
+        "  SELECT DISTINCT wm.workspace_id, wm.workspace_name\r\n",
+        "  FROM workspace_master_latest_by_name wm\r\n",
+        "  CROSS JOIN param_ws p\r\n",
+        "  WHERE p.ws_name IS NOT NULL\r\n",
+        "    AND wm.workspace_name = p.ws_name\r\n",
+        "),\r\n",
+        "-- 3) アカウントレベルの予算・契約情報を取得（最新のレコードのみ）\r\n",
+        "account_contract AS (\r\n",
+        "  SELECT\r\n",
+        "    contract_id,\r\n",
+        "    budget_usd AS total_budget_usd,\r\n",
+        "    threshold_usd AS total_threshold_usd,\r\n",
+        "    contract_start_date,\r\n",
+        "    contract_end_date\r\n",
+        "  FROM audit_validation.budget_schema.account_budget_contracts\r\n",
+        "  WHERE updated_at = (\r\n",
+        "    SELECT MAX(updated_at) FROM audit_validation.budget_schema.account_budget_contracts\r\n",
+        "  )\r\n",
+        "),\r\n",
+        "-- 4) 利用料集計（アカウント契約期間内のデータを取得）\r\n",
+        "usage_aggregated AS (\r\n",
+        "  SELECT\r\n",
+        "    date_trunc(\r\n",
+        "      CASE\r\n",
+        "        WHEN :param_time_key = '月' THEN 'month'\r\n",
+        "        WHEN :param_time_key = '週' THEN 'week'\r\n",
+        "        ELSE 'day'\r\n",
+        "      END,\r\n",
+        "      u.usage_date\r\n",
+        "    ) AS display_date,\r\n",
+        "    ac.contract_id,\r\n",
+        "    SUM(u.usage_usd) AS period_usage_usd\r\n",
+        "  FROM audit_validation.usage_schema.ws_usage_filtered u\r\n",
+        "  CROSS JOIN account_contract ac\r\n",
+        "  LEFT JOIN target_workspace tw ON u.workspace_id = tw.workspace_id\r\n",
+        "  WHERE u.usage_date BETWEEN ac.contract_start_date AND ac.contract_end_date\r\n",
+        "    AND (\r\n",
+        "      :param_workspace IS NULL\r\n",
+        "      OR :param_workspace = '<ALL WORKSPACES>'\r\n",
+        "      OR tw.workspace_name = :param_workspace\r\n",
+        "    )\r\n",
+        "  GROUP BY 1, 2\r\n",
+        "),\r\n",
+        "-- 5) 累積利用料集計\r\n",
+        "usage_with_cumulative AS (\r\n",
+        "  SELECT\r\n",
+        "    u.display_date,\r\n",
+        "    date_format(u.display_date, 'yyyy年MM月dd日') AS date_str,\r\n",
+        "    CASE WHEN :param_workspace = '<ALL WORKSPACES>' THEN 'All Workspaces' ELSE :param_workspace END AS display_name,\r\n",
+        "    u.contract_id,\r\n",
+        "    u.period_usage_usd,\r\n",
+        "    CAST(SUM(u.period_usage_usd) OVER (\r\n",
+        "      ORDER BY u.display_date ASC\r\n",
+        "    ) AS double) AS cumulative_usd,\r\n",
+        "    ac.total_budget_usd,\r\n",
+        "    ac.total_threshold_usd\r\n",
+        "  FROM usage_aggregated u\r\n",
+        "  CROSS JOIN account_contract ac\r\n",
+        "  ORDER BY display_date ASC\r\n",
+        "),\r\n",
+        "-- 6) 可視化対象\r\n",
+        "final AS (\r\n",
+        "  SELECT\r\n",
+        "    display_date,\r\n",
+        "    CASE\r\n",
+        "      WHEN :param_time_key = '月'   THEN date_format(display_date, 'yyyy年MM月')\r\n",
+        "      WHEN :param_time_key = '週'    THEN concat(\r\n",
+        "        date_format(display_date, 'yyyy年MM月dd日'),\r\n",
+        "        '〜',\r\n",
+        "        date_format(date_add(display_date, 6), 'MM月dd日')\r\n",
+        "      )\r\n",
+        "      ELSE date_format(display_date, 'yyyy年MM月dd日')\r\n",
+        "    END AS period,\r\n",
+        "    period_usage_usd,\r\n",
+        "    cumulative_usd,\r\n",
+        "    total_budget_usd AS budget_usd_limit,\r\n",
+        "    total_threshold_usd AS threshold_usd_limit,\r\n",
+        "    CASE WHEN total_budget_usd IS NOT NULL AND cumulative_usd > total_budget_usd THEN TRUE ELSE FALSE END AS budget_flag,\r\n",
+        "    CASE WHEN total_threshold_usd IS NOT NULL AND cumulative_usd > total_threshold_usd THEN TRUE ELSE FALSE END AS threshold_flag,\r\n",
+        "    CASE WHEN (cumulative_usd - total_budget_usd) > 0 THEN (cumulative_usd - total_budget_usd) ELSE 0 END AS budget_exceeded_usd,\r\n",
+        "    CASE WHEN (cumulative_usd - total_threshold_usd) > 0 THEN (cumulative_usd - total_threshold_usd) ELSE 0 END AS threshold_exceeded_usd\r\n",
+        "  FROM usage_with_cumulative\r\n",
+        ")\r\n",
+        "SELECT *\r\n",
+        "FROM final \r\n",
+        "WHERE display_date BETWEEN :param_start_date AND :param_end_date\r\n",
+        "ORDER BY period;"
+      ],
+      "parameters": [
+        {
+          "displayName": "param_workspace",
+          "keyword": "param_workspace",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": "<ALL WORKSPACES>"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "param_time_key",
+          "keyword": "param_time_key",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": "月"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "param_start_date",
+          "keyword": "param_start_date",
+          "dataType": "DATE",
+          "defaultSelection": {
+            "values": {
+              "dataType": "DATE",
+              "values": [
+                {
+                  "value": "now-30d/d"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "param_end_date",
+          "keyword": "param_end_date",
+          "dataType": "DATE",
+          "defaultSelection": {
+            "values": {
+              "dataType": "DATE",
+              "values": [
+                {
+                  "value": "now-1d/d"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "name": "page1",
+      "displayName": "利用料ダッシュボード",
+      "layout": [
+        {
+          "widget": {
+            "name": "globalStartDate",
+            "queries": [
+              {
+                "name": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec44153bac3884184054115d_param_start_date",
+                "query": {
+                  "datasetName": "93665994",
+                  "parameters": [
+                    {
+                      "name": "param_start_date",
+                      "keyword": "param_start_date"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415b98b13d8884a63d78b_param_start_date",
+                "query": {
+                  "datasetName": "f43352cc",
+                  "parameters": [
+                    {
+                      "name": "param_start_date",
+                      "keyword": "param_start_date"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415d0b5843d3e8af1bd0b_param_start_date",
+                "query": {
+                  "datasetName": "e958046b",
+                  "parameters": [
+                    {
+                      "name": "param_start_date",
+                      "keyword": "param_start_date"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415c6b0629d775dae9c61_param_start_date",
+                "query": {
+                  "datasetName": "7bc1d82b",
+                  "parameters": [
+                    {
+                      "name": "param_start_date",
+                      "keyword": "param_start_date"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed3014f31e68a457fad7525f60f5_param_start_date",
+                "query": {
+                  "datasetName": "9be49e38",
+                  "parameters": [
+                    {
+                      "name": "param_start_date",
+                      "keyword": "param_start_date"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415daa15abc26039c416f_param_start_date",
+                "query": {
+                  "datasetName": "543b10a2",
+                  "parameters": [
+                    {
+                      "name": "param_start_date",
+                      "keyword": "param_start_date"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0f1ed5f99170cb091b842c9d07649_param_start_date",
+                "query": {
+                  "datasetName": "9f947c8f",
+                  "parameters": [
+                    {
+                      "name": "param_start_date",
+                      "keyword": "param_start_date"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-date-picker",
+              "encodings": {
+                "fields": [
+                  {
+                    "parameterName": "param_start_date",
+                    "queryName": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec44153bac3884184054115d_param_start_date"
+                  },
+                  {
+                    "parameterName": "param_start_date",
+                    "queryName": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415b98b13d8884a63d78b_param_start_date"
+                  },
+                  {
+                    "parameterName": "param_start_date",
+                    "queryName": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415d0b5843d3e8af1bd0b_param_start_date"
+                  },
+                  {
+                    "parameterName": "param_start_date",
+                    "queryName": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415c6b0629d775dae9c61_param_start_date"
+                  },
+                  {
+                    "parameterName": "param_start_date",
+                    "queryName": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed3014f31e68a457fad7525f60f5_param_start_date"
+                  },
+                  {
+                    "parameterName": "param_start_date",
+                    "queryName": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415daa15abc26039c416f_param_start_date"
+                  },
+                  {
+                    "parameterName": "param_start_date",
+                    "queryName": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0f1ed5f99170cb091b842c9d07649_param_start_date"
+                  }
+                ]
+              },
+              "frame": {
+                "showDescription": false,
+                "showTitle": true,
+                "title": "開始日"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 2,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "globalEndDate",
+            "queries": [
+              {
+                "name": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec44153bac3884184054115d_param_end_date",
+                "query": {
+                  "datasetName": "93665994",
+                  "parameters": [
+                    {
+                      "name": "param_end_date",
+                      "keyword": "param_end_date"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415b98b13d8884a63d78b_param_end_date",
+                "query": {
+                  "datasetName": "f43352cc",
+                  "parameters": [
+                    {
+                      "name": "param_end_date",
+                      "keyword": "param_end_date"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415d0b5843d3e8af1bd0b_param_end_date",
+                "query": {
+                  "datasetName": "e958046b",
+                  "parameters": [
+                    {
+                      "name": "param_end_date",
+                      "keyword": "param_end_date"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415c6b0629d775dae9c61_param_end_date",
+                "query": {
+                  "datasetName": "7bc1d82b",
+                  "parameters": [
+                    {
+                      "name": "param_end_date",
+                      "keyword": "param_end_date"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed3014f31e68a457fad7525f60f5_param_end_date",
+                "query": {
+                  "datasetName": "9be49e38",
+                  "parameters": [
+                    {
+                      "name": "param_end_date",
+                      "keyword": "param_end_date"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415daa15abc26039c416f_param_end_date",
+                "query": {
+                  "datasetName": "543b10a2",
+                  "parameters": [
+                    {
+                      "name": "param_end_date",
+                      "keyword": "param_end_date"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0f1ed5f99170cb091b842c9d07649_param_end_date",
+                "query": {
+                  "datasetName": "9f947c8f",
+                  "parameters": [
+                    {
+                      "name": "param_end_date",
+                      "keyword": "param_end_date"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-date-picker",
+              "encodings": {
+                "fields": [
+                  {
+                    "parameterName": "param_end_date",
+                    "queryName": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec44153bac3884184054115d_param_end_date"
+                  },
+                  {
+                    "parameterName": "param_end_date",
+                    "queryName": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415b98b13d8884a63d78b_param_end_date"
+                  },
+                  {
+                    "parameterName": "param_end_date",
+                    "queryName": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415d0b5843d3e8af1bd0b_param_end_date"
+                  },
+                  {
+                    "parameterName": "param_end_date",
+                    "queryName": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415c6b0629d775dae9c61_param_end_date"
+                  },
+                  {
+                    "parameterName": "param_end_date",
+                    "queryName": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed3014f31e68a457fad7525f60f5_param_end_date"
+                  },
+                  {
+                    "parameterName": "param_end_date",
+                    "queryName": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415daa15abc26039c416f_param_end_date"
+                  },
+                  {
+                    "parameterName": "param_end_date",
+                    "queryName": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0f1ed5f99170cb091b842c9d07649_param_end_date"
+                  }
+                ]
+              },
+              "frame": {
+                "showDescription": false,
+                "showTitle": true,
+                "title": "終了日"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 1,
+            "width": 2,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "s1ParamTimeKey",
+            "queries": [
+              {
+                "name": "dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4414d39b18d0ddd9d1f3d1_time_key",
+                "query": {
+                  "datasetName": "select_time_key_overview",
+                  "fields": [
+                    {
+                      "name": "time_key",
+                      "expression": "`time_key`"
+                    },
+                    {
+                      "name": "time_key_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415b98b13d8884a63d78b_param_time_key",
+                "query": {
+                  "datasetName": "f43352cc",
+                  "parameters": [
+                    {
+                      "name": "param_time_key",
+                      "keyword": "param_time_key"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec44153bac3884184054115d_param_time_key",
+                "query": {
+                  "datasetName": "93665994",
+                  "parameters": [
+                    {
+                      "name": "param_time_key",
+                      "keyword": "param_time_key"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415d0b5843d3e8af1bd0b_param_time_key",
+                "query": {
+                  "datasetName": "e958046b",
+                  "parameters": [
+                    {
+                      "name": "param_time_key",
+                      "keyword": "param_time_key"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed3014f31e68a457fad7525f60f5_param_time_key",
+                "query": {
+                  "datasetName": "9be49e38",
+                  "parameters": [
+                    {
+                      "name": "param_time_key",
+                      "keyword": "param_time_key"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415daa15abc26039c416f_param_time_key",
+                "query": {
+                  "datasetName": "543b10a2",
+                  "parameters": [
+                    {
+                      "name": "param_time_key",
+                      "keyword": "param_time_key"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0f1ed5f99170cb091b842c9d07649_param_time_key",
+                "query": {
+                  "datasetName": "9f947c8f",
+                  "parameters": [
+                    {
+                      "name": "param_time_key",
+                      "keyword": "param_time_key"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "time_key",
+                    "queryName": "dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4414d39b18d0ddd9d1f3d1_time_key"
+                  },
+                  {
+                    "parameterName": "param_time_key",
+                    "queryName": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415b98b13d8884a63d78b_param_time_key"
+                  },
+                  {
+                    "parameterName": "param_time_key",
+                    "queryName": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec44153bac3884184054115d_param_time_key"
+                  },
+                  {
+                    "parameterName": "param_time_key",
+                    "queryName": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415d0b5843d3e8af1bd0b_param_time_key"
+                  },
+                  {
+                    "parameterName": "param_time_key",
+                    "queryName": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed3014f31e68a457fad7525f60f5_param_time_key"
+                  },
+                  {
+                    "parameterName": "param_time_key",
+                    "queryName": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415daa15abc26039c416f_param_time_key"
+                  },
+                  {
+                    "parameterName": "param_time_key",
+                    "queryName": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0f1ed5f99170cb091b842c9d07649_param_time_key"
+                  }
+                ]
+              },
+              "frame": {
+                "showDescription": false,
+                "showTitle": true,
+                "title": "期間粒度"
+              },
+              "selection": {
+                "defaultSelection": {
+                  "values": {
+                    "dataType": "STRING",
+                    "values": [
+                      {
+                        "value": "日"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 1,
+            "width": 2,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "8a44df86",
+            "queries": [
+              {
+                "name": "dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec44152aa84dc7faf7c8e2cb_group_key",
+                "query": {
+                  "datasetName": "select_group_key",
+                  "fields": [
+                    {
+                      "name": "group_key",
+                      "expression": "`group_key`"
+                    },
+                    {
+                      "name": "group_key_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415b98b13d8884a63d78b_param_group_key",
+                "query": {
+                  "datasetName": "f43352cc",
+                  "parameters": [
+                    {
+                      "name": "param_group_key",
+                      "keyword": "param_group_key"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415daa15abc26039c416f_param_group_key",
+                "query": {
+                  "datasetName": "543b10a2",
+                  "parameters": [
+                    {
+                      "name": "param_group_key",
+                      "keyword": "param_group_key"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "group_key",
+                    "queryName": "dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec44152aa84dc7faf7c8e2cb_group_key"
+                  },
+                  {
+                    "parameterName": "param_group_key",
+                    "queryName": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415b98b13d8884a63d78b_param_group_key"
+                  },
+                  {
+                    "parameterName": "param_group_key",
+                    "queryName": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415daa15abc26039c416f_param_group_key"
+                  }
+                ]
+              },
+              "selection": {
+                "defaultSelection": {
+                  "values": {
+                    "dataType": "STRING",
+                    "values": [
+                      {
+                        "value": "ワークスペース別"
+                      }
+                    ]
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "絞り込み対象"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 1,
+            "width": 2,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "yojitsu-kanri-teburu-shuuseiban",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "9f947c8f",
+                  "fields": [
+                    {
+                      "name": "period",
+                      "expression": "`period`"
+                    },
+                    {
+                      "name": "period_usage_usd",
+                      "expression": "`period_usage_usd`"
+                    },
+                    {
+                      "name": "cumulative_usd",
+                      "expression": "`cumulative_usd`"
+                    },
+                    {
+                      "name": "budget_usd_limit",
+                      "expression": "`budget_usd_limit`"
+                    },
+                    {
+                      "name": "threshold_usd_limit",
+                      "expression": "`threshold_usd_limit`"
+                    },
+                    {
+                      "name": "budget_flag",
+                      "expression": "`budget_flag`"
+                    },
+                    {
+                      "name": "threshold_flag",
+                      "expression": "`threshold_flag`"
+                    },
+                    {
+                      "name": "budget_exceeded_usd",
+                      "expression": "`budget_exceeded_usd`"
+                    },
+                    {
+                      "name": "threshold_exceeded_usd",
+                      "expression": "`threshold_exceeded_usd`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 1,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "period",
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "imageHeight": "",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkOpenInNewTab": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "visible": true,
+                    "order": 1,
+                    "title": "期間",
+                    "allowSearch": false,
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "highlightLinks": false,
+                    "useMonospaceFont": false,
+                    "preserveWhitespace": false
+                  },
+                  {
+                    "fieldName": "period_usage_usd",
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "imageHeight": "",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkOpenInNewTab": true,
+                    "type": "decimal",
+                    "displayAs": "number",
+                    "visible": true,
+                    "order": 2,
+                    "title": "期間合計利用料",
+                    "allowSearch": false,
+                    "alignContent": "right",
+                    "allowHTML": false,
+                    "highlightLinks": false,
+                    "useMonospaceFont": false,
+                    "preserveWhitespace": false
+                  },
+                  {
+                    "fieldName": "cumulative_usd",
+                    "numberFormat": "0.00",
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "imageHeight": "",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkOpenInNewTab": true,
+                    "type": "float",
+                    "displayAs": "number",
+                    "visible": true,
+                    "order": 3,
+                    "title": "期間累積利用料",
+                    "allowSearch": false,
+                    "alignContent": "right",
+                    "allowHTML": false,
+                    "highlightLinks": false,
+                    "useMonospaceFont": false,
+                    "preserveWhitespace": false
+                  },
+                  {
+                    "fieldName": "budget_usd_limit",
+                    "numberFormat": "0.00",
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "imageHeight": "",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkOpenInNewTab": true,
+                    "type": "float",
+                    "displayAs": "number",
+                    "visible": true,
+                    "order": 4,
+                    "title": "予算",
+                    "allowSearch": false,
+                    "alignContent": "right",
+                    "allowHTML": false,
+                    "highlightLinks": false,
+                    "useMonospaceFont": false,
+                    "preserveWhitespace": false
+                  },
+                  {
+                    "fieldName": "threshold_usd_limit",
+                    "numberFormat": "0.00",
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "imageHeight": "",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkOpenInNewTab": true,
+                    "type": "float",
+                    "displayAs": "number",
+                    "visible": true,
+                    "order": 5,
+                    "title": "予算閾値",
+                    "allowSearch": false,
+                    "alignContent": "right",
+                    "allowHTML": false,
+                    "highlightLinks": false,
+                    "useMonospaceFont": false,
+                    "preserveWhitespace": false
+                  },
+                  {
+                    "fieldName": "budget_flag",
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "imageHeight": "",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkOpenInNewTab": true,
+                    "type": "boolean",
+                    "displayAs": "boolean",
+                    "visible": true,
+                    "order": 5,
+                    "title": "予算閾値",
+                    "allowSearch": false,
+                    "alignContent": "right",
+                    "allowHTML": false,
+                    "highlightLinks": false,
+                    "useMonospaceFont": false,
+                    "preserveWhitespace": false
+                  },
+                  {
+                    "fieldName": "budget_flag",
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "imageHeight": "",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkOpenInNewTab": true,
+                    "type": "boolean",
+                    "displayAs": "boolean",
+                    "visible": true,
+                    "order": 6,
+                    "title": "予算超過フラグ",
+                    "allowSearch": false,
+                    "alignContent": "right",
+                    "allowHTML": false,
+                    "highlightLinks": false,
+                    "useMonospaceFont": false,
+                    "preserveWhitespace": false
+                  },
+                  {
+                    "fieldName": "threshold_flag",
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "imageHeight": "",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkOpenInNewTab": true,
+                    "type": "boolean",
+                    "displayAs": "boolean",
+                    "visible": true,
+                    "order": 7,
+                    "title": "閾値超過フラグ",
+                    "allowSearch": false,
+                    "alignContent": "right",
+                    "allowHTML": false,
+                    "highlightLinks": false,
+                    "useMonospaceFont": false,
+                    "preserveWhitespace": false
+                  },
+                  {
+                    "fieldName": "budget_exceeded_usd",
+                    "numberFormat": "0.00",
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "imageHeight": "",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkOpenInNewTab": true,
+                    "type": "float",
+                    "displayAs": "number",
+                    "visible": true,
+                    "order": 8,
+                    "title": "予算超過料",
+                    "allowSearch": false,
+                    "alignContent": "right",
+                    "allowHTML": false,
+                    "highlightLinks": false,
+                    "useMonospaceFont": false,
+                    "preserveWhitespace": false
+                  },
+                  {
+                    "fieldName": "threshold_exceeded_usd",
+                    "numberFormat": "0.00",
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "imageHeight": "",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkOpenInNewTab": true,
+                    "type": "float",
+                    "displayAs": "number",
+                    "visible": true,
+                    "order": 9,
+                    "title": "閾値超過料",
+                    "allowSearch": false,
+                    "alignContent": "right",
+                    "allowHTML": false,
+                    "highlightLinks": false,
+                    "useMonospaceFont": false,
+                    "preserveWhitespace": false
+                  }
+                ]
+              },
+              "invisibleColumns": [
+                {
+                  "dateTimeFormat": "DD/MM/YYYY HH:mm:ss.SSS",
+                  "booleanValues": [
+                    "false",
+                    "true"
+                  ],
+                  "imageUrlTemplate": "{{ @ }}",
+                  "imageTitleTemplate": "{{ @ }}",
+                  "imageWidth": "",
+                  "imageHeight": "",
+                  "linkUrlTemplate": "{{ @ }}",
+                  "linkTextTemplate": "{{ @ }}",
+                  "linkTitleTemplate": "{{ @ }}",
+                  "linkOpenInNewTab": true,
+                  "name": "display_date",
+                  "type": "datetime",
+                  "displayAs": "datetime",
+                  "order": 0,
+                  "title": "display_date",
+                  "allowSearch": false,
+                  "alignContent": "right",
+                  "allowHTML": false,
+                  "highlightLinks": false,
+                  "useMonospaceFont": false,
+                  "preserveWhitespace": false
+                }
+              ],
+              "allowHTMLByDefault": false,
+              "itemsPerPage": 25,
+              "paginationSize": "default",
+              "condensed": true,
+              "withRowNumber": false,
+              "frame": {
+                "showTitle": true,
+                "title": "予実管理テーブル(USD)"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 14,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "seikyumoto-seihinbetsu-sku-betsu-teburu-1",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "543b10a2",
+                  "fields": [
+                    {
+                      "name": "group_key",
+                      "expression": "`group_key`"
+                    },
+                    {
+                      "name": "Start to End date",
+                      "expression": "`Start to End date`"
+                    },
+                    {
+                      "name": "Current period",
+                      "expression": "`Current period`"
+                    },
+                    {
+                      "name": "Last period",
+                      "expression": "`Last period`"
+                    },
+                    {
+                      "name": "2 periods ago",
+                      "expression": "`2 periods ago`"
+                    },
+                    {
+                      "name": "3 periods ago",
+                      "expression": "`3 periods ago`"
+                    },
+                    {
+                      "name": "4 periods ago",
+                      "expression": "`4 periods ago`"
+                    },
+                    {
+                      "name": "5 periods ago",
+                      "expression": "`5 periods ago`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 1,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "group_key",
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "imageHeight": "",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkOpenInNewTab": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "visible": true,
+                    "order": 0,
+                    "title": "種別",
+                    "allowSearch": false,
+                    "alignContent": "left",
+                    "allowHTML": true,
+                    "highlightLinks": false,
+                    "useMonospaceFont": false,
+                    "preserveWhitespace": false
+                  },
+                  {
+                    "fieldName": "Start to End date",
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "imageHeight": "",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkOpenInNewTab": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "visible": true,
+                    "order": 1,
+                    "title": "集計期間",
+                    "allowSearch": false,
+                    "alignContent": "left",
+                    "allowHTML": true,
+                    "highlightLinks": false,
+                    "useMonospaceFont": false,
+                    "preserveWhitespace": false
+                  },
+                  {
+                    "fieldName": "Current period",
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "imageHeight": "",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkOpenInNewTab": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "visible": true,
+                    "order": 4,
+                    "title": "当期間",
+                    "allowSearch": false,
+                    "alignContent": "left",
+                    "allowHTML": true,
+                    "highlightLinks": false,
+                    "useMonospaceFont": false,
+                    "preserveWhitespace": false
+                  },
+                  {
+                    "fieldName": "Last period",
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "imageHeight": "",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkOpenInNewTab": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "visible": true,
+                    "order": 5,
+                    "title": "1期間前",
+                    "allowSearch": false,
+                    "alignContent": "left",
+                    "allowHTML": true,
+                    "highlightLinks": false,
+                    "useMonospaceFont": false,
+                    "preserveWhitespace": false
+                  },
+                  {
+                    "fieldName": "2 periods ago",
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "imageHeight": "",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkOpenInNewTab": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "visible": true,
+                    "order": 6,
+                    "title": "2期間前",
+                    "allowSearch": false,
+                    "alignContent": "left",
+                    "allowHTML": true,
+                    "highlightLinks": false,
+                    "useMonospaceFont": false,
+                    "preserveWhitespace": false
+                  },
+                  {
+                    "fieldName": "3 periods ago",
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "imageHeight": "",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkOpenInNewTab": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "visible": true,
+                    "order": 7,
+                    "title": "3期間前",
+                    "allowSearch": false,
+                    "alignContent": "left",
+                    "allowHTML": true,
+                    "highlightLinks": false,
+                    "useMonospaceFont": false,
+                    "preserveWhitespace": false
+                  },
+                  {
+                    "fieldName": "4 periods ago",
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "imageHeight": "",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkOpenInNewTab": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "visible": true,
+                    "order": 8,
+                    "title": "4期間前",
+                    "allowSearch": false,
+                    "alignContent": "left",
+                    "allowHTML": true,
+                    "highlightLinks": false,
+                    "useMonospaceFont": false,
+                    "preserveWhitespace": false
+                  },
+                  {
+                    "fieldName": "5 periods ago",
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "imageHeight": "",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkOpenInNewTab": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "visible": true,
+                    "order": 9,
+                    "title": "5期間前",
+                    "allowSearch": false,
+                    "alignContent": "left",
+                    "allowHTML": true,
+                    "highlightLinks": false,
+                    "useMonospaceFont": false,
+                    "preserveWhitespace": false
+                  }
+                ]
+              },
+              "invisibleColumns": [
+                {
+                  "numberFormat": "0.00",
+                  "booleanValues": [
+                    "false",
+                    "true"
+                  ],
+                  "imageUrlTemplate": "{{ @ }}",
+                  "imageTitleTemplate": "{{ @ }}",
+                  "imageWidth": "",
+                  "imageHeight": "",
+                  "linkUrlTemplate": "{{ @ }}",
+                  "linkTextTemplate": "{{ @ }}",
+                  "linkTitleTemplate": "{{ @ }}",
+                  "linkOpenInNewTab": true,
+                  "name": "_all_time_usage_usd",
+                  "type": "float",
+                  "displayAs": "number",
+                  "order": 2,
+                  "title": "_all_time_usage_usd",
+                  "allowSearch": false,
+                  "alignContent": "right",
+                  "allowHTML": false,
+                  "highlightLinks": false,
+                  "useMonospaceFont": false,
+                  "preserveWhitespace": false
+                },
+                {
+                  "numberFormat": "0",
+                  "booleanValues": [
+                    "false",
+                    "true"
+                  ],
+                  "imageUrlTemplate": "{{ @ }}",
+                  "imageTitleTemplate": "{{ @ }}",
+                  "imageWidth": "",
+                  "imageHeight": "",
+                  "linkUrlTemplate": "{{ @ }}",
+                  "linkTextTemplate": "{{ @ }}",
+                  "linkTitleTemplate": "{{ @ }}",
+                  "linkOpenInNewTab": true,
+                  "name": "_order",
+                  "type": "integer",
+                  "displayAs": "number",
+                  "order": 3,
+                  "title": "_order",
+                  "allowSearch": false,
+                  "alignContent": "right",
+                  "allowHTML": false,
+                  "highlightLinks": false,
+                  "useMonospaceFont": false,
+                  "preserveWhitespace": false
+                }
+              ],
+              "allowHTMLByDefault": false,
+              "itemsPerPage": 25,
+              "paginationSize": "default",
+              "condensed": true,
+              "withRowNumber": false,
+              "frame": {
+                "showTitle": true,
+                "title": "ワークスペース別・請求元製品別・SKU別テーブル(USD)"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 26,
+            "width": 6,
+            "height": 5
+          }
+        },
+        {
+          "widget": {
+            "name": "seikyumoto-seihinbetsu-sku-betsu-gurafu-shuuseiban-2",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "f43352cc",
+                  "fields": [
+                    {
+                      "name": "group_key",
+                      "expression": "`group_key`"
+                    },
+                    {
+                      "name": "display_date",
+                      "expression": "`display_date`"
+                    },
+                    {
+                      "name": "usage_usd",
+                      "expression": "`usage_usd`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "display_date",
+                  "format": {
+                    "type": "date-time",
+                    "date": "year-month-day",
+                    "time": "none"
+                  },
+                  "displayName": "期間",
+                  "scale": {
+                    "type": "categorical",
+                    "categorySize": {
+                      "type": "number-of-categories",
+                      "number": 10
+                    }
+                  }
+                },
+                "y": {
+                  "fieldName": "usage_usd",
+                  "format": {
+                    "type": "number-plain",
+                    "abbreviation": "compact",
+                    "decimalPlaces": {
+                      "type": "max",
+                      "places": 2
+                    }
+                  },
+                  "displayName": "セグメント別利用料",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                },
+                "color": {
+                  "fieldName": "group_key",
+                  "displayName": "種別",
+                  "scale": {
+                    "type": "categorical",
+                    "sort": {
+                      "by": "custom-order",
+                      "orderedValues": [
+                        "ENTERPRISE_ALL_PURPOSE_COMPUTE",
+                        "ENTERPRISE_ALL_PURPOSE_COMPUTE_(PHOTON)",
+                        "ENTERPRISE_ALL_PURPOSE_SERVERLESS_COMPUTE_AP_TOKYO",
+                        "ENTERPRISE_ANTHROPIC_MODEL_SERVING",
+                        "ENTERPRISE_DLT_ADVANCED_COMPUTE",
+                        "ENTERPRISE_GEMINI_MODEL_SERVING",
+                        "ENTERPRISE_JOBS_COMPUTE",
+                        "ENTERPRISE_JOBS_COMPUTE_(PHOTON)",
+                        "ENTERPRISE_JOBS_SERVERLESS_COMPUTE_AP_TOKYO",
+                        "ENTERPRISE_SERVERLESS_REAL_TIME_INFERENCE_AP_TOKYO",
+                        "ENTERPRISE_SERVERLESS_SQL_COMPUTE_AP_TOKYO",
+                        "ENTERPRISE_SQL_COMPUTE",
+                        "ENTERPRISE_SQL_PRO_COMPUTE_AP_TOKYO",
+                        "INTER_AVAILABILITY_ZONE_EGRESS",
+                        "INTER_REGION_EGRESS_FROM_AP_TOKYO",
+                        "INTERNET_EGRESS_FROM_AP_TOKYO",
+                        "PUBLIC_CONNECTIVITY_DATA_PROCESSED_AP_TOKYO"
+                      ]
+                    }
+                  }
+                },
+                "label": {
+                  "show": false
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "ワークスペース別・請求元製品別・SKU別グラフ(USD)"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 20,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "jissekichi-gurafu",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "9be49e38",
+                  "fields": [
+                    {
+                      "name": "display_date",
+                      "expression": "`display_date`"
+                    },
+                    {
+                      "name": "period_usage_usd",
+                      "expression": "`period_usage_usd`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "display_date",
+                  "format": {
+                    "type": "date-time",
+                    "date": "year-month-day",
+                    "time": "none"
+                  },
+                  "displayName": "期間",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                },
+                "y": {
+                  "fieldName": "period_usage_usd",
+                  "format": {
+                    "type": "number-currency",
+                    "currencyCode": "USD",
+                    "abbreviation": "compact",
+                    "decimalPlaces": {
+                      "type": "max",
+                      "places": 2
+                    }
+                  },
+                  "displayName": "実績値",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "実績値グラフ(USD)"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "ruiseki-riyouryou-gurafu",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "e958046b",
+                  "fields": [
+                    {
+                      "name": "display_date",
+                      "expression": "`display_date`"
+                    },
+                    {
+                      "name": "cumulative_usage_usd",
+                      "expression": "`cumulative_usage_usd`"
+                    },
+                    {
+                      "name": "total_budget_usd",
+                      "expression": "`total_budget_usd`"
+                    },
+                    {
+                      "name": "total_threshold_usd",
+                      "expression": "`total_threshold_usd`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 1,
+              "widgetType": "combo",
+              "encodings": {
+                "x": {
+                  "fieldName": "display_date",
+                  "format": {
+                    "type": "date-time",
+                    "date": "year-month-day",
+                    "time": "none"
+                  },
+                  "displayName": "期間",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                },
+                "label": {
+                  "show": false
+                },
+                "y": {
+                  "primary": {
+                    "fields": [
+                      {
+                        "fieldName": "cumulative_usage_usd",
+                        "displayName": "累積利用料"
+                      }
+                    ]
+                  },
+                  "secondary": {
+                    "fields": [
+                      {
+                        "fieldName": "total_budget_usd",
+                        "displayName": "予算"
+                      },
+                      {
+                        "fieldName": "total_threshold_usd",
+                        "displayName": "閾値"
+                      }
+                    ]
+                  },
+                  "scale": {
+                    "type": "quantitative",
+                    "reverse": false,
+                    "domain": {
+                      "min": 0
+                    }
+                  },
+                  "axis": {
+                    "hideGrid": false,
+                    "hideLabels": false,
+                    "title": "累積利用料"
+                  },
+                  "format": {
+                    "type": "number-currency",
+                    "currencyCode": "USD",
+                    "abbreviation": "compact",
+                    "decimalPlaces": {
+                      "type": "max",
+                      "places": 2
+                    },
+                    "hideGroupSeparator": false
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "累積利用料グラフ(USD)",
+                "showDescription": false
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 8,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "workspace",
+            "queries": [
+              {
+                "name": "dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec441534b4d83d16a644886e_workspace_name",
+                "query": {
+                  "datasetName": "select_workspace",
+                  "fields": [
+                    {
+                      "name": "workspace_name",
+                      "expression": "`workspace_name`"
+                    },
+                    {
+                      "name": "workspace_name_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec44153bac3884184054115d_param_workspace",
+                "query": {
+                  "datasetName": "93665994",
+                  "parameters": [
+                    {
+                      "name": "param_workspace",
+                      "keyword": "param_workspace"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415b98b13d8884a63d78b_param_workspace",
+                "query": {
+                  "datasetName": "f43352cc",
+                  "parameters": [
+                    {
+                      "name": "param_workspace",
+                      "keyword": "param_workspace"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415d0b5843d3e8af1bd0b_param_workspace",
+                "query": {
+                  "datasetName": "e958046b",
+                  "parameters": [
+                    {
+                      "name": "param_workspace",
+                      "keyword": "param_workspace"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415c6b0629d775dae9c61_param_workspace",
+                "query": {
+                  "datasetName": "7bc1d82b",
+                  "parameters": [
+                    {
+                      "name": "param_workspace",
+                      "keyword": "param_workspace"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed3014f31e68a457fad7525f60f5_param_workspace",
+                "query": {
+                  "datasetName": "9be49e38",
+                  "parameters": [
+                    {
+                      "name": "param_workspace",
+                      "keyword": "param_workspace"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415daa15abc26039c416f_param_workspace",
+                "query": {
+                  "datasetName": "543b10a2",
+                  "parameters": [
+                    {
+                      "name": "param_workspace",
+                      "keyword": "param_workspace"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0f1ed5f99170cb091b842c9d07649_param_workspace",
+                "query": {
+                  "datasetName": "9f947c8f",
+                  "parameters": [
+                    {
+                      "name": "param_workspace",
+                      "keyword": "param_workspace"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "workspace_name",
+                    "queryName": "dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec441534b4d83d16a644886e_workspace_name"
+                  },
+                  {
+                    "parameterName": "param_workspace",
+                    "queryName": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec44153bac3884184054115d_param_workspace"
+                  },
+                  {
+                    "parameterName": "param_workspace",
+                    "queryName": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415b98b13d8884a63d78b_param_workspace"
+                  },
+                  {
+                    "parameterName": "param_workspace",
+                    "queryName": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415d0b5843d3e8af1bd0b_param_workspace"
+                  },
+                  {
+                    "parameterName": "param_workspace",
+                    "queryName": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415c6b0629d775dae9c61_param_workspace"
+                  },
+                  {
+                    "parameterName": "param_workspace",
+                    "queryName": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed3014f31e68a457fad7525f60f5_param_workspace"
+                  },
+                  {
+                    "parameterName": "param_workspace",
+                    "queryName": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0ed2bec4415daa15abc26039c416f_param_workspace"
+                  },
+                  {
+                    "parameterName": "param_workspace",
+                    "queryName": "parameter_dashboards/01f0ed2b3cc718e7a8debbcb3f7072f5/datasets/01f0f1ed5f99170cb091b842c9d07649_param_workspace"
+                  }
+                ]
+              },
+              "disallowAll": true,
+              "selection": {
+                "defaultSelection": {
+                  "values": {
+                    "dataType": "STRING",
+                    "values": [
+                      {
+                        "value": "<ALL WORKSPACES>"
+                      }
+                    ]
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "対象ワークスペース"
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 0,
+            "width": 3,
+            "height": 1
+          }
+        }
+      ],
+      "pageType": "PAGE_TYPE_CANVAS"
+    }
+  ],
+  "uiSettings": {
+    "theme": {
+      "widgetHeaderAlignment": "ALIGNMENT_UNSPECIFIED"
+    },
+    "applyModeEnabled": false
+  }
+}
